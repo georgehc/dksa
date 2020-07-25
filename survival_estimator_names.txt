@@ -1,0 +1,16 @@
+coxph : Cox
+rsf : RSF
+deepsurv : DeepSurv
+deephit : DeepHit
+mtlr : MTLR
+nnet_survival : Nnet-survival
+coxcc : Cox-CC
+coxtime : Cox-Time
+pc_hazard : PC-Hazard
+nks_basic : NKS-Basic
+nks_diag : NKS-Diag
+nks_res_basic : NKS-Res-Basic
+nks_res_diag : NKS-Res-Diag
+nks_mlp : NKS-MLP
+nks_mlp_init_rsf_full_train : NKS-MLP (init: RSF)
+nks_mlp_init_deephit_full_train : NKS-MLP (init: DeepHit)
