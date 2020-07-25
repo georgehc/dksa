@@ -193,10 +193,8 @@ class NKSDiscrete(models.base.SurvBase):
     label_transform = label_transforms.LabTransDiscreteTime
 
     def __init__(self, net, optimizer=None, device=None, duration_index=None,
-                 loss=None, truncate=np.inf, split_loss=False,
-                 surv_method='km'):
+                 loss=None, split_loss=False, surv_method='km'):
         self.duration_index = duration_index
-        self.truncate = truncate
         self.surv_method = surv_method
         if loss is None:
             loss = NLLKernelHazardLoss()
