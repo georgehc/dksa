@@ -5,6 +5,7 @@ Author: George H. Chen (georgechen [at symbol] cmu.edu)
 This code accompanies the paper:
 
 > George H. Chen. "Deep Kernel Survival Analysis and Subject-Specific Survival Time Prediction Intervals". MLHC 2020.
+> [arXiv](https://arxiv.org/abs/2007.12975)
 
 Code requirements:
 
