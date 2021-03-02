@@ -145,7 +145,7 @@ def nll_kernel_hazard(phi: Tensor, idx_durations: Tensor, events: Tensor,
 
     # kernel hazard function calculation
     num_at_risk = ((weights_discretized.flip(1)).cumsum(1)).flip(1) + 1e-12
-    num_deaths = weights_discretized * y_bce
+    num_deaths = torch.matmul(weights, y_bce)
     hazards = torch.clamp(num_deaths / num_at_risk, 1e-12, 1. - 1e-12)
 
     bce = F.binary_cross_entropy(hazards, y_bce, reduction='none')
@@ -178,7 +178,7 @@ def nll_kernel_hazard_no_discretization(phi: Tensor, durations: Tensor,
 
     # kernel hazard function calculation
     num_at_risk = ((weights.flip(1)).cumsum(1)).flip(1) + 1e-12
-    num_deaths = weights * y_bce
+    num_deaths = torch.matmul(weights, y_bce)
     hazards = torch.clamp(num_deaths / num_at_risk, 1e-12, 1. - 1e-12)
 
     bce = F.binary_cross_entropy(hazards, y_bce, reduction='none')

@@ -45,7 +45,10 @@ os.makedirs(output_dir, exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'train'), exist_ok=True)
 
-n_jobs = min(max_n_cores, os.cpu_count())
+if max_n_cores <= 0:
+    n_jobs = os.cpu_count()
+else:
+    n_jobs = min(max_n_cores, os.cpu_count())
 
 hyperparams = \
     [(max_features, min_samples_leaf, use_km)

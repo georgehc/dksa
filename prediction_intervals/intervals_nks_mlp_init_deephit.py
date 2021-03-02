@@ -50,15 +50,12 @@ conformal_prediction_random_seed = \
     int(config['DEFAULT']['conformal_prediction_random_seed'])
 conformal_prediction_n_samples = \
     int(config['DEFAULT']['conformal_prediction_n_samples'])
-max_n_cores = int(config['DEFAULT']['max_n_cores'])
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'split_conformal_prediction'),
             exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'weighted_split_conformal_prediction'),
             exist_ok=True)
-
-n_jobs = min(max_n_cores, os.cpu_count())
 
 init_best_cv_hyperparam_filename \
     = os.path.join(output_dir, 'train',

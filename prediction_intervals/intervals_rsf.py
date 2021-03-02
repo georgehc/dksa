@@ -52,7 +52,10 @@ os.makedirs(os.path.join(output_dir, 'split_conformal_prediction'),
 os.makedirs(os.path.join(output_dir, 'weighted_split_conformal_prediction'),
             exist_ok=True)
 
-n_jobs = min(max_n_cores, os.cpu_count())
+if max_n_cores <= 0:
+    n_jobs = os.cpu_count()
+else:
+    n_jobs = min(max_n_cores, os.cpu_count())
 output_best_cv_hyperparam_filename \
     = os.path.join(output_dir, 'train',
                    '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
