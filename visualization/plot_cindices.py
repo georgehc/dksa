@@ -24,10 +24,22 @@ if not (len(sys.argv) == 3 and os.path.isfile(sys.argv[1])):
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
 n_experiment_repeats = int(config['DEFAULT']['n_experiment_repeats'])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+use_early_stopping = int(config['DEFAULT']['use_early_stopping']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 datasets = ast.literal_eval(config['DEFAULT']['datasets'])
 output_dir = config['DEFAULT']['output_dir']
 os.makedirs(os.path.join(output_dir, 'plots'), exist_ok=True)
+
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+    init_val_string = val_string
+else:
+    val_string = 'vr%f' % val_ratio
+    init_val_string = val_string
+    if use_early_stopping:
+        val_string += '_earlystop'
 
 survival_estimator_names = []
 estimator_display_names = []
@@ -45,16 +57,23 @@ for survival_estimator_name in survival_estimator_names:
     if survival_estimator_name == 'coxph':
         table_filename = \
             os.path.join(output_dir,
-                         '%s_experiments%d_test_metrics_bootstrap.csv'
+                         '%s_nexp%d_test_metrics.csv'
                          % (survival_estimator_name,
                             n_experiment_repeats))
+    elif survival_estimator_name == 'rsf':
+        table_filename = \
+            os.path.join(output_dir,
+                         '%s_nexp%d_%s_test_metrics.csv'
+                         % (survival_estimator_name,
+                            n_experiment_repeats,
+                            init_val_string))
     else:
         table_filename = \
             os.path.join(output_dir,
-                         '%s_experiments%d_cv%d_test_metrics_bootstrap.csv'
+                         '%s_nexp%d_%s_test_metrics.csv'
                          % (survival_estimator_name,
                             n_experiment_repeats,
-                            cross_val_n_folds))
+                            val_string))
     if not os.path.isfile(table_filename):
         print('File not found:', table_filename)
     assert os.path.isfile(table_filename)

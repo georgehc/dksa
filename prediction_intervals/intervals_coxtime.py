@@ -4,6 +4,7 @@ import configparser
 import csv
 import os
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import pickle
 import sys
 sys.path.insert(1, os.path.dirname(sys.path[0]))
@@ -11,12 +12,12 @@ __package__ = 'prediction_intervals'
 
 import numpy as np
 import torch
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 import torch.nn as nn
-from lifelines.utils import concordance_index
-from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split
 
 import torchtuples as tt
-from pycox.evaluation import EvalSurv
 from pycox.models import CoxTime
 from pycox.models.cox_time import MLPVanillaCoxTime
 from survival_datasets import load_dataset
@@ -35,6 +36,9 @@ dataset = sys.argv[3]
 
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+use_early_stopping = int(config['DEFAULT']['use_early_stopping']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 output_dir = config['DEFAULT']['output_dir']
 method_header = 'method: %s' % survival_estimator_name
@@ -52,19 +56,26 @@ os.makedirs(os.path.join(output_dir, 'split_conformal_prediction'),
 os.makedirs(os.path.join(output_dir, 'weighted_split_conformal_prediction'),
             exist_ok=True)
 
-output_best_cv_hyperparam_filename \
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+else:
+    val_string = 'vr%f' % val_ratio
+    if use_early_stopping:
+        val_string += '_earlystop'
+
+output_best_val_hyperparam_filename \
     = os.path.join(output_dir, 'train',
-                   '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                   '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                    % (survival_estimator_name, dataset, experiment_idx,
-                      cross_val_n_folds))
-if not os.path.isfile(output_best_cv_hyperparam_filename):
+                      val_string))
+if not os.path.isfile(output_best_val_hyperparam_filename):
     raise Exception("File does not exist: %s\n\n"
-                    % output_best_cv_hyperparam_filename
+                    % output_best_val_hyperparam_filename
                     + 'Running the benchmark demo first should resolve this.')
 
-with open(output_best_cv_hyperparam_filename, 'rb') as pickle_file:
-    best_cv_hyperparams = pickle.load(pickle_file)
-arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
+with open(output_best_val_hyperparam_filename, 'rb') as pickle_file:
+    best_val_hyperparams = pickle.load(pickle_file)
+arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
 batch_size, n_epochs, n_layers, n_nodes, lr = arg_max_cindex
 hyperparam = arg_max_cindex
 
@@ -91,10 +102,18 @@ y_train = y_train.astype('float32')
 y_test = y_test.astype('float32')
 
 torch.manual_seed(method_random_seed)
+torch.cuda.manual_seed_all(method_random_seed)
 np.random.seed(method_random_seed)
 
 labtrans = CoxTime.label_transform()
-y_train_std = labtrans.fit_transform(*y_train.T)
+if use_cross_val:
+    labtrans.fit(*y_train.T)
+else:
+    train_idx, _ = train_test_split(range(len(X_train)),
+                                        test_size=val_ratio,
+                                        shuffle=False)
+    fold_y_train = y_train[train_idx].astype('float32')
+    labtrans.fit(*fold_y_train.T)
 
 batch_norm = True
 dropout = 0.0
@@ -111,19 +130,12 @@ surv_model = CoxTime(net, optimizer, labtrans=labtrans)
 
 model_filename = \
     os.path.join(output_dir, 'models',
-                 '%s_%s_exp%d_bs%d_nep%d_nla%d_nno%d_lr%f_test.pt'
+                 '%s_%s_exp%d_%s_bs%d_nep%d_nla%d_nno%d_lr%f_test.pt'
                  % (survival_estimator_name, dataset, experiment_idx,
-                    batch_size, n_epochs, n_layers, n_nodes, lr))
+                    val_string, batch_size, n_epochs, n_layers, n_nodes, lr))
 assert os.path.isfile(model_filename)
-if not os.path.isfile(model_filename):
-    print('*** Fitting with hyperparam:', hyperparam, flush=True)
-    surv_model.fit(X_train_std, y_train_std,
-                   batch_size, n_epochs, verbose=False)
-    surv_model.compute_baseline_hazards()
-    surv_model.save_net(model_filename)
-else:
-    print('*** Loading ***', flush=True)
-    surv_model.load_net(model_filename)
+print('*** Loading ***', flush=True)
+surv_model.load_net(model_filename)
 
 surv_df = surv_model.predict_surv_df(X_test_std)
 surv = surv_df.to_numpy().T
@@ -249,10 +261,10 @@ for survival_time_estimator in ['mean', 'median']:
         qhats_np = np.array(qhats_np)
         output_filename_prefix = \
             os.path.join(output_dir, 'split_conformal_prediction',
-                         '%s_%s_exp%d_bs%d_nep%d_nla%d_nno%d_lr%f_%s_calib%f'
+                         '%s_%s_exp%d_%s_bs%d_nep%d_nla%d_nno%d_lr%f_%s_calib%f'
                          % (survival_estimator_name, dataset, experiment_idx,
-                            batch_size, n_epochs, n_layers, n_nodes, lr,
-                            survival_time_estimator, calib_frac))
+                            val_string, batch_size, n_epochs, n_layers, n_nodes,
+                            lr, survival_time_estimator, calib_frac))
         np.savetxt(output_filename_prefix + '_coverages.txt',
                    coverages_np)
         np.savetxt(output_filename_prefix + '_qhats.txt',

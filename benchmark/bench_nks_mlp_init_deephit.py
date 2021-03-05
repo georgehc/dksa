@@ -4,18 +4,21 @@ import configparser
 import csv
 import os
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import pickle
 import sys
 sys.path.insert(1, os.path.dirname(sys.path[0]))
 __package__ = 'benchmark'
 import time
+from shutil import copyfile
 
 import numpy as np
 import pandas as pd
 import torch
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 import torch.nn as nn
-from lifelines.utils import concordance_index
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 
 import torchtuples as tt
 from neural_kernel_survival import NKS, NKSDiscrete
@@ -35,6 +38,9 @@ if not (len(sys.argv) == 2 and os.path.isfile(sys.argv[1])):
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
 n_experiment_repeats = int(config['DEFAULT']['n_experiment_repeats'])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+use_early_stopping = int(config['DEFAULT']['use_early_stopping']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 datasets = ast.literal_eval(config['DEFAULT']['datasets'])
 output_dir = config['DEFAULT']['output_dir']
@@ -49,23 +55,33 @@ os.makedirs(output_dir, exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'train'), exist_ok=True)
 
+n_epochs_list = ast.literal_eval(config[method_header]['n_epochs'])
+if use_early_stopping and not use_cross_val:
+    n_epochs_list = [np.max(n_epochs_list)]
 hyperparams = \
     [(batch_size, n_epochs, lr, num_durations)
      for batch_size
      in ast.literal_eval(config[method_header]['batch_size'])
      for n_epochs
-     in ast.literal_eval(config[method_header]['n_epochs'])
+     in n_epochs_list
      for lr
      in ast.literal_eval(config[method_header]['learning_rate'])
      for num_durations
      in ast.literal_eval(config[method_header]['num_durations'])]
 
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+else:
+    val_string = 'vr%f' % val_ratio
+    if use_early_stopping:
+        val_string += '_earlystop'
+
 output_test_table_filename \
     = os.path.join(output_dir,
-                   '%s_experiments%d_cv%d_test_metrics_bootstrap.csv'
+                   '%s_nexp%d_%s_test_metrics.csv'
                    % (survival_estimator_name,
                       n_experiment_repeats,
-                      cross_val_n_folds))
+                      val_string))
 output_test_table_file = open(output_test_table_filename, 'w')
 test_csv_writer = csv.writer(output_test_table_file)
 test_csv_writer.writerow(['dataset',
@@ -95,16 +111,16 @@ for experiment_idx in range(n_experiment_repeats):
                 compute_features_and_transformer, transform_features = \
             load_dataset(dataset, experiment_idx)
 
-        init_best_cv_hyperparam_filename \
+        init_best_val_hyperparam_filename \
             = os.path.join(output_dir, 'train',
-                           '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                           '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                            % (init_survival_estimator_name, dataset,
                               experiment_idx,
-                              cross_val_n_folds))
-        assert os.path.isfile(init_best_cv_hyperparam_filename)
-        with open(init_best_cv_hyperparam_filename, 'rb') as pickle_file:
-            best_cv_hyperparams = pickle.load(pickle_file)
-        arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
+                              val_string))
+        assert os.path.isfile(init_best_val_hyperparam_filename)
+        with open(init_best_val_hyperparam_filename, 'rb') as pickle_file:
+            best_val_hyperparams = pickle.load(pickle_file)
+        arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
         init_batch_size, init_n_epochs, n_layers, n_nodes, init_lr, \
             init_alpha, init_sigma, init_num_durations = arg_max_cindex
 
@@ -118,23 +134,29 @@ for experiment_idx in range(n_experiment_repeats):
 
         output_train_metrics_filename \
             = os.path.join(output_dir, 'train',
-                           '%s_%s_exp%d_cv%d_train_metrics.txt'
+                           '%s_%s_exp%d_%s_train_metrics.txt'
                            % (survival_estimator_name, dataset, experiment_idx,
-                              cross_val_n_folds))
-        output_best_cv_hyperparam_filename \
+                              val_string))
+        output_best_val_hyperparam_filename \
             = os.path.join(output_dir, 'train',
-                           '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                           '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                            % (survival_estimator_name, dataset, experiment_idx,
-                              cross_val_n_folds))
+                              val_string))
         if not os.path.isfile(output_train_metrics_filename) or \
-                not os.path.isfile(output_best_cv_hyperparam_filename):
+                not os.path.isfile(output_best_val_hyperparam_filename):
             print('Training...', flush=True)
             train_metrics_file = open(output_train_metrics_filename, 'w')
-            best_cv_hyperparams = {}
-
+            best_val_hyperparams = {}
 
             # load_dataset already shuffles; no need to reshuffle
-            kf = KFold(n_splits=cross_val_n_folds, shuffle=False)
+            if use_cross_val:
+                kf = KFold(n_splits=cross_val_n_folds, shuffle=False)
+                train_data_split = list(kf.split(X_train))
+            else:
+                train_data_split = [train_test_split(range(len(X_train)),
+                                                     test_size=val_ratio,
+                                                     shuffle=False)]
+
             max_cindex = -np.inf
             min_integrated_brier = np.inf
             arg_max_cindex = None
@@ -145,14 +167,13 @@ for experiment_idx in range(n_experiment_repeats):
                 cindex_scores = []
                 integrated_brier_scores = []
 
-                for cross_val_idx, (train_idx, val_idx) \
-                        in enumerate(kf.split(X_train)):
+                for fold_idx, (train_idx, val_idx) \
+                        in enumerate(train_data_split):
                     fold_X_train = X_train[train_idx]
-                    fold_y_train = y_train[train_idx]
+                    fold_y_train = y_train[train_idx].astype('float32')
                     fold_X_val = X_train[val_idx]
-                    fold_y_val = y_train[val_idx]
+                    fold_y_val = y_train[val_idx].astype('float32')
 
-                    # standardized features needed for neural net but not RSF
                     fold_X_train_std, transformer = \
                             compute_features_and_transformer(fold_X_train)
                     fold_X_val_std = transform_features(fold_X_val, transformer)
@@ -162,6 +183,7 @@ for experiment_idx in range(n_experiment_repeats):
                     # pre-train on full training data
                     tic = time.time()
                     torch.manual_seed(init_random_seed)
+                    torch.cuda.manual_seed_all(init_random_seed)
                     np.random.seed(init_random_seed)
 
                     # for DeepHit, train on full dataset
@@ -186,10 +208,11 @@ for experiment_idx in range(n_experiment_repeats):
 
                     model_filename = \
                         os.path.join(output_dir, 'models',
-                                     '%s_%s_exp%d_bs%d_nep%d_nla%d_nno%d_'
+                                     '%s_%s_exp%d_%s_bs%d_nep%d_nla%d_nno%d_'
                                      % (init_survival_estimator_name, dataset,
-                                        experiment_idx, init_batch_size,
-                                        init_n_epochs, n_layers, n_nodes)
+                                        experiment_idx, val_string,
+                                        init_batch_size, init_n_epochs,
+                                        n_layers, n_nodes)
                                      +
                                      'lr%f_a%f_s%f_nd%d_test.pt'
                                      % (init_lr, init_alpha, init_sigma,
@@ -220,6 +243,7 @@ for experiment_idx in range(n_experiment_repeats):
                     print('*** Fine-tuning with DKSA...')
                     tic = time.time()
                     torch.manual_seed(fine_tune_random_seed)
+                    torch.cuda.manual_seed_all(fine_tune_random_seed)
                     np.random.seed(fine_tune_random_seed)
                     net = nn.Sequential(*surv_model.net.net,
                                         nn.Softmax(1))
@@ -228,6 +252,8 @@ for experiment_idx in range(n_experiment_repeats):
                         labtrans = NKSDiscrete.label_transform(num_durations)
                         fold_y_train_discrete \
                             = labtrans.fit_transform(*fold_y_train.T)
+                        fold_y_val_discrete \
+                            = labtrans.transform(*fold_y_val.T)
                         surv_model = NKSDiscrete(net, optimizer,
                                                  duration_index=labtrans.cuts)
                     else:
@@ -235,28 +261,53 @@ for experiment_idx in range(n_experiment_repeats):
 
                     model_filename = \
                         os.path.join(output_dir, 'models',
-                                     '%s_%s_exp%d_'
+                                     '%s_%s_exp%d_%s_'
                                      % (survival_estimator_name, dataset,
-                                        experiment_idx)
+                                        experiment_idx, val_string)
                                      +
                                      'bs%d_nep%d_nla%d_nno%d_'
                                      % (batch_size, n_epochs, n_layers, n_nodes)
                                      +
-                                     'lr%f_nd%d_cv%d.pt'
-                                     % (lr, num_durations, cross_val_idx))
+                                     'lr%f_nd%d_fold%d.pt'
+                                     % (lr, num_durations, fold_idx))
                     time_elapsed_filename = model_filename[:-3] + '_time.txt'
                     if not os.path.isfile(model_filename):
-                        print('*** Fitting with hyperparam:', hyperparam,
-                              '-- cross val index:', cross_val_idx, flush=True)
-                        if num_durations > 0:
-                            surv_model.fit(fold_X_train_std,
-                                           fold_y_train_discrete,
-                                           batch_size, n_epochs, verbose=False)
+                        if use_cross_val:
+                            print('*** Fitting with hyperparam:', hyperparam,
+                                  '-- cross val index:', fold_idx, flush=True)
                         else:
-                            surv_model.fit(fold_X_train_std,
-                                           (fold_y_train[:, 0],
-                                            fold_y_train[:, 1]), batch_size,
-                                           n_epochs, verbose=False)
+                            print('*** Fitting with hyperparam:', hyperparam,
+                                  flush=True)
+                        if num_durations > 0:
+                            if use_early_stopping and not use_cross_val:
+                                surv_model.fit(fold_X_train_std,
+                                               fold_y_train_discrete,
+                                               batch_size, n_epochs,
+                                               [tt.callbacks.EarlyStopping()],
+                                               val_data=(fold_X_val_std,
+                                                         fold_y_val_discrete),
+                                               verbose=False)
+                            else:
+                                surv_model.fit(fold_X_train_std,
+                                               fold_y_train_discrete,
+                                               batch_size, n_epochs,
+                                               verbose=False)
+                        else:
+                            if use_early_stopping and not use_cross_val:
+                                surv_model.fit(fold_X_train_std,
+                                               (fold_y_train[:, 0],
+                                                fold_y_train[:, 1]), batch_size,
+                                               n_epochs,
+                                               [tt.callbacks.EarlyStopping()],
+                                               val_data=(fold_X_val_std,
+                                                         (fold_y_val[:, 0],
+                                                          fold_y_val[:, 1])),
+                                               verbose=False)
+                            else:
+                                surv_model.fit(fold_X_train_std,
+                                               (fold_y_train[:, 0],
+                                                fold_y_train[:, 1]), batch_size,
+                                               n_epochs, verbose=False)
                         elapsed = time.time() - tic
                         print('Time elapsed: %f second(s)' % elapsed)
                         np.savetxt(time_elapsed_filename,
@@ -279,7 +330,8 @@ for experiment_idx in range(n_experiment_repeats):
 
                     if num_durations > 0:
                         surv_df = \
-                            surv_model.interpolate(10).predict_surv_df(fold_X_val_std)
+                            surv_model.interpolate(10).predict_surv_df(
+                                fold_X_val_std)
                     else:
                         surv_df = surv_model.predict_surv_df(fold_X_val_std)
                     ev = EvalSurv(surv_df, fold_y_val[:, 0], fold_y_val[:, 1],
@@ -316,20 +368,21 @@ for experiment_idx in range(n_experiment_repeats):
 
             train_metrics_file.close()
 
-            best_cv_hyperparams['cindex_td'] = (arg_max_cindex, max_cindex)
-            best_cv_hyperparams['integrated_brier'] \
-                = (arg_min_integrated_brier, min_integrated_brier)
+            best_val_hyperparams['cindex_td'] = \
+                (arg_max_cindex, max_cindex)
+            best_val_hyperparams['integrated_brier'] = \
+                (arg_min_integrated_brier, min_integrated_brier)
 
-            with open(output_best_cv_hyperparam_filename, 'wb') as pickle_file:
-                pickle.dump(best_cv_hyperparams, pickle_file,
+            with open(output_best_val_hyperparam_filename, 'wb') as pickle_file:
+                pickle.dump(best_val_hyperparams, pickle_file,
                             protocol=pickle.HIGHEST_PROTOCOL)
         else:
             print('Loading previous cross-validation results...', flush=True)
-            with open(output_best_cv_hyperparam_filename, 'rb') as pickle_file:
-                best_cv_hyperparams = pickle.load(pickle_file)
-            arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
+            with open(output_best_val_hyperparam_filename, 'rb') as pickle_file:
+                best_val_hyperparams = pickle.load(pickle_file)
+            arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
             arg_min_integrated_brier, min_integrated_brier \
-                = best_cv_hyperparams['integrated_brier']
+                = best_val_hyperparams['integrated_brier']
 
         print('Best hyperparameters for maximizing training c-index (td):',
               arg_max_cindex, '-- achieves score %5.4f' % max_cindex,
@@ -351,6 +404,7 @@ for experiment_idx in range(n_experiment_repeats):
             # pre-train on full training data
             tic = time.time()
             torch.manual_seed(init_random_seed)
+            torch.cuda.manual_seed_all(init_random_seed)
             np.random.seed(init_random_seed)
 
             # for DeepHit, train on full dataset
@@ -375,9 +429,9 @@ for experiment_idx in range(n_experiment_repeats):
 
             model_filename = \
                 os.path.join(output_dir, 'models',
-                             '%s_%s_exp%d_bs%d_nep%d_nla%d_nno%d_'
+                             '%s_%s_exp%d_%s_bs%d_nep%d_nla%d_nno%d_'
                              % (init_survival_estimator_name, dataset,
-                                experiment_idx, init_batch_size,
+                                experiment_idx, val_string, init_batch_size,
                                 init_n_epochs, n_layers, n_nodes)
                              +
                              'lr%f_a%f_s%f_nd%d_test.pt'
@@ -409,6 +463,7 @@ for experiment_idx in range(n_experiment_repeats):
             print('*** Fine-tuning with DKSA...')
             tic = time.time()
             torch.manual_seed(fine_tune_random_seed)
+            torch.cuda.manual_seed_all(fine_tune_random_seed)
             np.random.seed(fine_tune_random_seed)
             net = nn.Sequential(*surv_model.net.net,
                                 nn.Softmax(1))
@@ -423,9 +478,9 @@ for experiment_idx in range(n_experiment_repeats):
 
             model_filename = \
                 os.path.join(output_dir, 'models',
-                             '%s_%s_exp%d_'
+                             '%s_%s_exp%d_%s_'
                              % (survival_estimator_name, dataset,
-                                experiment_idx)
+                                experiment_idx, val_string)
                              +
                              'bs%d_nep%d_nla%d_nno%d_'
                              % (batch_size, n_epochs, n_layers, n_nodes)
@@ -433,6 +488,31 @@ for experiment_idx in range(n_experiment_repeats):
                              'lr%f_nd%d_test.pt'
                              % (lr, num_durations))
             time_elapsed_filename = model_filename[:-3] + '_time.txt'
+            if not use_cross_val:
+                val_model_filename = \
+                    os.path.join(output_dir, 'models',
+                                 '%s_%s_exp%d_%s_'
+                                 % (survival_estimator_name, dataset,
+                                    experiment_idx, val_string)
+                                 +
+                                 'bs%d_nep%d_nla%d_nno%d_'
+                                 % (batch_size, n_epochs, n_layers, n_nodes)
+                                 +
+                                 'lr%f_nd%d_fold%d.pt'
+                                 % (lr, num_durations, 0))
+                val_time_elapsed_filename = \
+                    val_model_filename[:-3] + '_time.txt'
+                copyfile(val_model_filename, model_filename)
+                copyfile(val_model_filename[:-3] + '_train_features.txt',
+                         model_filename[:-3] + '_train_features.txt')
+                copyfile(val_model_filename[:-3] + '_train_observed_times.txt',
+                         model_filename[:-3] + '_train_observed_times.txt')
+                copyfile(val_model_filename[:-3] + '_train_events.txt',
+                         model_filename[:-3] + '_train_events.txt')
+                copyfile(val_model_filename[:-3] + '_train_embeddings.txt',
+                         model_filename[:-3] + '_train_embeddings.txt')
+                copyfile(val_time_elapsed_filename,
+                         time_elapsed_filename)
             if not os.path.isfile(model_filename):
                 print('*** Fitting with hyperparam:', hyperparam, flush=True)
                 if num_durations > 0:
@@ -491,9 +571,9 @@ for experiment_idx in range(n_experiment_repeats):
 
             bootstrap_dir = \
                 os.path.join(output_dir, 'bootstrap',
-                             '%s_%s_exp%d_'
+                             '%s_%s_exp%d_%s_'
                              % (survival_estimator_name, dataset,
-                                experiment_idx)
+                                experiment_idx, val_string)
                              +
                              'bs%d_nep%d_nla%d_nno%d_'
                              % (batch_size, n_epochs, n_layers, n_nodes)

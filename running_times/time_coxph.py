@@ -12,7 +12,7 @@ import time
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 
 from survival_datasets import load_dataset
 
@@ -26,10 +26,17 @@ if not (len(sys.argv) == 2 and os.path.isfile(sys.argv[1])):
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
 n_experiment_repeats = int(config['DEFAULT']['n_experiment_repeats'])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 datasets = ast.literal_eval(config['DEFAULT']['datasets'])
 output_dir = config['DEFAULT']['output_dir']
 os.makedirs(os.path.join(output_dir, 'timing'), exist_ok=True)
+
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+else:
+    val_string = 'vr%f' % val_ratio
 
 for experiment_idx in range(n_experiment_repeats):
     for dataset in datasets:
@@ -48,10 +55,19 @@ for experiment_idx in range(n_experiment_repeats):
         if dataset == 'support2_onehot':
             feature_names = feature_names[:-1]
 
-        cv_fitting_times = []
-        kf = KFold(n_splits=cross_val_n_folds, shuffle=False)
-        for cross_val_idx, (train_idx, val_idx) \
-                in enumerate(kf.split(X_train)):
+        if use_cross_val:
+            kf = KFold(n_splits=cross_val_n_folds, shuffle=False)
+            train_data_split = list(kf.split(X_train))
+        else:
+            rng = np.random.RandomState(3188842715)
+            train_data_split = [train_test_split(range(len(X_train)),
+                                                 test_size=val_ratio,
+                                                 random_state=rng,
+                                                 shuffle=True)
+                                for fold_idx in range(cross_val_n_folds)]
+
+        fitting_times = []
+        for fold_idx, (train_idx, val_idx) in enumerate(train_data_split):
             fold_X_train = X_train[train_idx]
             fold_y_train = y_train[train_idx]
 
@@ -71,17 +87,17 @@ for experiment_idx in range(n_experiment_repeats):
                            show_progress=False, step_size=.1)
             elapsed = time.time() - tic
             print(elapsed)
-            cv_fitting_times.append(elapsed)
+            fitting_times.append(elapsed)
 
         print()
 
         output_timing_filename \
             = os.path.join(output_dir, 'timing',
-                           '%s_%s_exp%d_cv%d_fitting_times.pkl'
+                           '%s_%s_exp%d_%s_fitting_times.pkl'
                            % (survival_estimator_name, dataset, experiment_idx,
-                              cross_val_n_folds))
+                              val_string))
 
         with open(output_timing_filename, 'wb') as pickle_file:
-            pickle.dump((cv_fitting_times,
+            pickle.dump((fitting_times,
                          None),
                         pickle_file)

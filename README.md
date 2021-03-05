@@ -13,6 +13,12 @@ Code requirements:
 - Additional packages: joblib, lifelines, pyarrow, pytorch (tested with PyTorch version 1.5 with CUDA 10.2)
 - cython compilation is required for the random survival forests implementation used:
 
+**Major code changes:**
+
+- March 4, 2021: added support for simple data splitting as an alternative to cross-validation for the hyperparameter sweep; simple data splitting just corresponds to the standard approach of splitting the training data into a proper training set and a validation set, and then tuning hyperparameters based on this validation set (including optionally using early stopping for neural net approaches)--there is no re-training on the full training set after the best hyperparameter is chosen; this is now set as the default behavior in `config.ini` (the results follow similar trends as those reported in the paper and runs faster than cross-validation)
+
+**Recommendation:** There are lots of variants of neural/deep kernel survival analysis that are implemented. At least for the datasets considered, warm-starting using random survival forests tends to work best (train the random survival forest (RSF) model first, and then run the code for NKS-MLP with RSF initialization).
+
 ```
 python setup_random_survival_forest_cython.py build_ext --inplace
 ```
@@ -42,11 +48,11 @@ The `config.ini` file contains hyperparameter search grids and other settings, i
 
 After running the demo, in the output directory (default: `./output/`), you should find:
 
-- `nks_res_diag_experiments1_cv5_test_metrics_bootstrap.csv` (contains final test set metrics, including time-dependent concordance index)
+- `nks_res_diag_*_test_metrics.csv` (contains final test set metrics, including time-dependent concordance index)
 - `train/*_best_cv_hyperparams.pkl` (pickle files containing best hyperparameters found per dataset and also per experimental repeat if you are running with experimental repeats, which by default is turned off)
-- `train/*_train_metrics.txt` (transcript that says what hyperparameter achieves what cross validation scores)
+- `train/*_train_metrics.txt` (transcript that says what hyperparameter achieves what validation/cross-validation scores)
 - `models/` (all trained models are saved here; re-running the demo will result in loading saved models rather than re-training them; to force re-training of a model, be sure to delete the corresponding saved models)
-- `bootstrap/` (per model trained on the full training dataset after cross-validation, the test set bootstrap test metrics are stored in here)
+- `bootstrap/` (per best model selected via the hyperparameter sweep, the test set bootstrap test metrics are stored in here)
 
 Other methods (aside from NKS-Res-Diag) can be trained similarly (look in the `benchmark` folder to see all the other demo scripts). Note that random survival forests (`benchmark/bench_rsf.py`) must already be trained before training NKS-MLP with random survival forest initialization (`benchmark/bench_nks_mlp_init_rsf.py`). Similarly, DeepHit (`benchmark/bench_deephit.py`) must already be trained before training NKS-MLP with DeepHit initialization (`benchmark/bench_nks_mlp_init_deephit.py`).
 
@@ -84,17 +90,17 @@ python visualization/plot_interval_width_vs_coverage_local.py config.ini surviva
 
 ### Running times
 
-To obtain the cross-validation training time plots, after running the non-prediction-interval demos, run, for example:
+To obtain the validation/cross-validation training time plots, after running the non-prediction-interval demos, run, for example:
 
 ```
-python running_times/time_cv_nks_res_diag.py config.ini
+python running_times/time_nks_res_diag.py config.ini
 ```
 
-This script aggregates timing data from cross-validation training and saves summary information to, by default, `./output/timing/*.pkl`.
+This script aggregates timing data from validation/cross-validation training and saves summary information to, by default, `./output/timing/*.pkl`.
 
-Finally, after running the above for all methods, you shold be able to produce the timing plots from the paper via running:
+Finally, after running the above for all methods, you shold be able to produce the timing plots from the paper via running (again, plots are saved by default to `./output/plots/`):
 
 ```
-python visualization/plot_cv_train_times_vs_methods.py config.ini survival_estimator_names.txt
-python visualization/plot_n_durations_cv_train_times.py config.ini survival_estimator_names.txt
+python visualization/plot_hyperparam_sweep_train_times_vs_methods.py config.ini survival_estimator_names.txt
+python visualization/plot_n_durations_vs_hyperparam_sweep_train_times.py config.ini survival_estimator_names.txt
 ```

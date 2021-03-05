@@ -23,6 +23,9 @@ experiment_idx = 0
 
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+use_early_stopping = int(config['DEFAULT']['use_early_stopping']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 datasets = ast.literal_eval(config['DEFAULT']['datasets'])
 output_dir = config['DEFAULT']['output_dir']
@@ -57,11 +60,21 @@ plt.figure(figsize=figsize)
 for dataset_idx, dataset in enumerate(datasets):
     all_times = []
     for survival_estimator_name in survival_estimator_names:
+        if use_cross_val:
+            val_string = 'cv%d' % cross_val_n_folds
+            val_string += '_'
+        else:
+            val_string = 'vr%f' % val_ratio
+            if survival_estimator_name != 'coxph' \
+                    and survival_estimator_name != 'rsf' \
+                    and use_early_stopping:
+                val_string += '_earlystop'
+            val_string += '_'
         timing_filename = \
             os.path.join(output_dir, 'timing',
-                         '%s_%s_exp%d_cv%d_fitting_times.pkl'
+                         '%s_%s_exp%d_%sfitting_times.pkl'
                          % (survival_estimator_name, dataset,
-                            experiment_idx, cross_val_n_folds))
+                            experiment_idx, val_string))
         with open(timing_filename, 'rb') as pickle_file:
             times, _ = pickle.load(pickle_file)
             all_times.append(times)
@@ -72,7 +85,8 @@ for dataset_idx, dataset in enumerate(datasets):
     ax.set_xscale('log')
 
     if dataset_idx == (n_datasets // 2):
-        plt.xlabel('Training time per cross-validation model fit (seconds)')
+        plt.xlabel(
+            'Training time per model fit during hyperparameter sweep (seconds)')
 
     if dataset_idx == 0:
         plt.yticks(range(1, n_estimators + 1),
@@ -90,5 +104,5 @@ for dataset_idx, dataset in enumerate(datasets):
 plt.tight_layout()
 plt.subplots_adjust(wspace=.05)
 plt.savefig(os.path.join(output_dir, 'plots',
-                         'cv_train_times_vs_methods.pdf'),
+                         'hyperparam_sweep_train_times_vs_methods.pdf'),
             bbox_inches='tight')

@@ -39,7 +39,7 @@ os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
 
 output_table_filename = \
     os.path.join(output_dir,
-                 '%s_experiments%d_test_metrics_bootstrap.csv'
+                 '%s_nexp%d_test_metrics.csv'
                  % (survival_estimator_name,
                     n_experiment_repeats))
 output_table_file = open(output_table_filename, 'w')

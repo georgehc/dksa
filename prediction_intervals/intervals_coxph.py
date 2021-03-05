@@ -11,11 +11,7 @@ __package__ = 'prediction_intervals'
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
-from lifelines.utils import concordance_index
-from sklearn.model_selection import KFold
 
-import torchtuples as tt
-from pycox.evaluation import EvalSurv
 from survival_datasets import load_dataset
 
 

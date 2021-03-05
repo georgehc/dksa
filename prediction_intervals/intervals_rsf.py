@@ -10,14 +10,8 @@ sys.path.insert(1, os.path.dirname(sys.path[0]))
 __package__ = 'prediction_intervals'
 
 import numpy as np
-import torch
-import torch.nn as nn
-from lifelines.utils import concordance_index
-from sklearn.model_selection import KFold
 
-import torchtuples as tt
 from npsurvival_models import RandomSurvivalForest
-from pycox.evaluation import EvalSurv
 from survival_datasets import load_dataset
 
 
@@ -34,6 +28,8 @@ dataset = sys.argv[3]
 
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 output_dir = config['DEFAULT']['output_dir']
 method_header = 'method: %s' % survival_estimator_name
@@ -56,20 +52,26 @@ if max_n_cores <= 0:
     n_jobs = os.cpu_count()
 else:
     n_jobs = min(max_n_cores, os.cpu_count())
-output_best_cv_hyperparam_filename \
+
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+else:
+    val_string = 'vr%f' % val_ratio
+
+output_best_val_hyperparam_filename \
     = os.path.join(output_dir, 'train',
-                   '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                   '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                    % (survival_estimator_name, dataset, experiment_idx,
-                      cross_val_n_folds))
-if not os.path.isfile(output_best_cv_hyperparam_filename):
+                      val_string))
+if not os.path.isfile(output_best_val_hyperparam_filename):
     raise Exception("File does not exist: %s\n\n"
-                    % output_best_cv_hyperparam_filename
+                    % output_best_val_hyperparam_filename
                     + 'Running the benchmark demo first should resolve this.')
 
-with open(output_best_cv_hyperparam_filename, 'rb') as pickle_file:
-    best_cv_hyperparams = pickle.load(pickle_file)
-arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
-max_features, min_samples_leaf, use_km = arg_max_cindex
+with open(output_best_val_hyperparam_filename, 'rb') as pickle_file:
+    best_val_hyperparams = pickle.load(pickle_file)
+arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
+max_features, min_samples_leaf = arg_max_cindex
 hyperparam = arg_max_cindex
 
 if dataset == 'rotterdam-gbsg2' and experiment_idx > 0:
@@ -88,9 +90,9 @@ X_train, y_train, X_test, y_test, feature_names, \
 print('Testing...', flush=True)
 model_filename = \
     os.path.join(output_dir, 'models',
-                 '%s_%s_exp%d_mf%d_msl%d_km%d_test.pkl'
+                 '%s_%s_exp%d_%s_mf%d_msl%d_test.pkl'
                  % (survival_estimator_name, dataset, experiment_idx,
-                    max_features, min_samples_leaf, use_km))
+                    val_string, max_features, min_samples_leaf))
 surv_model = RandomSurvivalForest.load(model_filename)
 surv_model.n_jobs = n_jobs
 sorted_unique_y_train = np.unique(y_train[:, 0])
@@ -219,9 +221,9 @@ for survival_time_estimator in ['mean', 'median']:
         qhats_np = np.array(qhats_np)
         output_filename_prefix = \
             os.path.join(output_dir, 'split_conformal_prediction',
-                         '%s_%s_exp%d_mf%d_msl%d_km%d_%s_calib%f'
+                         '%s_%s_exp%d_%s_mf%d_msl%d_%s_calib%f'
                          % (survival_estimator_name, dataset, experiment_idx,
-                            max_features, min_samples_leaf, use_km,
+                            val_string, max_features, min_samples_leaf,
                             survival_time_estimator, calib_frac))
         np.savetxt(output_filename_prefix + '_coverages.txt',
                    coverages_np)
@@ -361,9 +363,9 @@ for survival_time_estimator in ['mean', 'median']:
         qhats_np = np.array(qhats_np)
         output_filename_prefix = \
             os.path.join(output_dir, 'weighted_split_conformal_prediction',
-                         '%s_%s_exp%d_mf%d_msl%d_km%d_%s_calib%f'
+                         '%s_%s_exp%d_%s_mf%d_msl%d_%s_calib%f'
                          % (survival_estimator_name, dataset, experiment_idx,
-                            max_features, min_samples_leaf, use_km,
+                            val_string, max_features, min_samples_leaf,
                             survival_time_estimator, calib_frac))
         np.savetxt(output_filename_prefix + '_coverages.txt',
                    coverages_np)

@@ -2,9 +2,9 @@
 import ast
 import configparser
 import csv
-import gc
 import os
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import pickle
 import sys
 sys.path.insert(1, os.path.dirname(sys.path[0]))
@@ -12,16 +12,15 @@ __package__ = 'prediction_intervals'
 
 import numpy as np
 import torch
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 import torch.nn as nn
-from lifelines.utils import concordance_index
-from sklearn.model_selection import KFold
 
 import torchtuples as tt
-from pycox.evaluation import EvalSurv
-from neural_kernel_survival import NKS, NKSDiscrete, ResidualBlock, Scaler
+from neural_kernel_survival import NKS, NKSDiscrete
+from torchtuples import Model
 from npsurvival_models import RandomSurvivalForest
 from survival_datasets import load_dataset
-from torchtuples import Model
 
 
 init_survival_estimator_name = 'rsf'
@@ -38,6 +37,9 @@ dataset = sys.argv[3]
 
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+use_early_stopping = int(config['DEFAULT']['use_early_stopping']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 output_dir = config['DEFAULT']['output_dir']
 init_random_seed = int(config['method: %s'
@@ -52,7 +54,6 @@ conformal_prediction_random_seed = \
     int(config['DEFAULT']['conformal_prediction_random_seed'])
 conformal_prediction_n_samples = \
     int(config['DEFAULT']['conformal_prediction_n_samples'])
-max_n_cores = int(config['DEFAULT']['max_n_cores'])
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'models'), exist_ok=True)
 os.makedirs(os.path.join(output_dir, 'split_conformal_prediction'),
@@ -60,36 +61,40 @@ os.makedirs(os.path.join(output_dir, 'split_conformal_prediction'),
 os.makedirs(os.path.join(output_dir, 'weighted_split_conformal_prediction'),
             exist_ok=True)
 
-if max_n_cores <= 0:
-    n_jobs = os.cpu_count()
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+    init_val_string = val_string
 else:
-    n_jobs = min(max_n_cores, os.cpu_count())
+    val_string = 'vr%f' % val_ratio
+    init_val_string = val_string
+    if use_early_stopping:
+        val_string += '_earlystop'
 
-init_best_cv_hyperparam_filename \
+init_best_val_hyperparam_filename \
     = os.path.join(output_dir, 'train',
-                   '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                   '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                    % (init_survival_estimator_name, dataset,
                       experiment_idx,
-                      cross_val_n_folds))
-assert os.path.isfile(init_best_cv_hyperparam_filename)
-with open(init_best_cv_hyperparam_filename, 'rb') as pickle_file:
-    best_cv_hyperparams = pickle.load(pickle_file)
-arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
-max_features, min_samples_leaf, use_km = arg_max_cindex
+                      init_val_string))
+assert os.path.isfile(init_best_val_hyperparam_filename)
+with open(init_best_val_hyperparam_filename, 'rb') as pickle_file:
+    best_val_hyperparams = pickle.load(pickle_file)
+arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
+max_features, min_samples_leaf = arg_max_cindex
 
-output_best_cv_hyperparam_filename \
+output_best_val_hyperparam_filename \
     = os.path.join(output_dir, 'train',
-                   '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                   '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                    % (survival_estimator_name, dataset, experiment_idx,
-                      cross_val_n_folds))
-if not os.path.isfile(output_best_cv_hyperparam_filename):
+                      val_string))
+if not os.path.isfile(output_best_val_hyperparam_filename):
     raise Exception("File does not exist: %s\n\n"
-                    % output_best_cv_hyperparam_filename
+                    % output_best_val_hyperparam_filename
                     + 'Running the benchmark demo first should resolve this.')
 
-with open(output_best_cv_hyperparam_filename, 'rb') as pickle_file:
-    best_cv_hyperparams = pickle.load(pickle_file)
-arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
+with open(output_best_val_hyperparam_filename, 'rb') as pickle_file:
+    best_val_hyperparams = pickle.load(pickle_file)
+arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
 batch_size, n_epochs, n_layers, n_nodes, lr, num_durations = arg_max_cindex
 hyperparam = arg_max_cindex
 
@@ -115,69 +120,9 @@ X_test_std = X_test_std.astype('float32')
 y_train = y_train.astype('float32')
 y_test = y_test.astype('float32')
 
-print('Pre-training...')
-model_filename = \
-    os.path.join(output_dir, 'models',
-                 '%s_%s_exp%d_mf%d_msl%d_km%d_test.pkl'
-                 % (init_survival_estimator_name, dataset,
-                    experiment_idx, max_features,
-                    min_samples_leaf, use_km))
-if not os.path.isfile(model_filename):
-    surv_model = \
-        RandomSurvivalForest(n_estimators=100,
-                             max_features=max_features,
-                             max_depth=None,
-                             oob_score=False,
-                             feature_importance=False,
-                             min_samples_leaf=min_samples_leaf,
-                             random_state=init_random_seed,
-                             n_jobs=n_jobs)
-    surv_model.fit(X_train, y_train)
-    surv_model.save(model_filename)
-else:
-    surv_model = RandomSurvivalForest.load(model_filename)
-
-print('*** Extracting proximity matrix...')
-prox_filename = model_filename[:-4] + '_prox_matrix.txt'
-if not os.path.isfile(prox_filename):
-    leaf_ids = surv_model.predict_leaf_ids(X_train)
-    n = len(X_train)
-    prox_matrix = np.eye(n)
-    for i in range(n):
-        for j in range(i + 1, n):
-            prox_matrix[i, j] = \
-                np.mean(leaf_ids[i] == leaf_ids[j])
-            prox_matrix[j, i] = prox_matrix[i, j]
-    np.savetxt(prox_filename, prox_matrix)
-else:
-    prox_matrix = np.loadtxt(prox_filename)
-
-del surv_model
-gc.collect()
-
-print('*** Computing MDS embedding...')
-kernel_matrix = np.clip(prox_matrix + 1e-7, 0., 1.)
-rsf_dists = np.sqrt(-np.log(kernel_matrix))
 mds_size = min(len(X_train), X_train.shape[1])
-mds_filename = model_filename[:-4] + '_mds%d.txt' % mds_size
-if not os.path.isfile(mds_filename):
-    mds = MDS(n_components=mds_size,
-              metric=True,
-              n_init=mds_n_init,
-              n_jobs=n_jobs,
-              random_state=mds_random_seed,
-              dissimilarity='precomputed')
-    mds_embedding = mds.fit_transform(rsf_dists)
-    np.savetxt(mds_filename, mds_embedding)
-else:
-    mds_embedding = np.loadtxt(mds_filename)
-mds_embedding = mds_embedding.astype('float32')
-
-print()
-
-
-print('*** Fitting neural net to MDS transformation...')
 torch.manual_seed(fine_tune_random_seed)
+torch.cuda.manual_seed_all(fine_tune_random_seed)
 np.random.seed(fine_tune_random_seed)
 batch_norm = True
 dropout = 0.
@@ -197,27 +142,23 @@ emb_model_filename = \
     os.path.join(output_dir, 'models',
                  'rsf_full_train_neural_approx_'
                  +
-                 '%s_exp%d_mf%d_msl%d_km%d_'
-                 % (dataset, experiment_idx,
-                    max_features, min_samples_leaf, use_km)
+                 '%s_exp%d_%s_mf%d_msl%d_'
+                 % (dataset, experiment_idx, init_val_string,
+                    max_features, min_samples_leaf)
                  +
                  'bs%d_nep%d_nla%d_nno%d_'
                  % (batch_size, 100, n_layers, n_nodes)
                  +
                  'lr%f_test.pt' % lr)
-if not os.path.isfile(emb_model_filename):
-    emb_model.fit(X_train_std, mds_embedding,
-                  batch_size=batch_size, epochs=100,
-                  verbose=False)
-    emb_model.save_net(emb_model_filename)
-else:
-    emb_model.load_net(emb_model_filename)
+assert os.path.isfile(emb_model_filename)
+emb_model.load_net(emb_model_filename)
 emb_model.net.train()
 
-print('*** Fine-tuning with DKSA...')
 torch.manual_seed(fine_tune_random_seed + 1)
+torch.cuda.manual_seed_all(fine_tune_random_seed + 1)
 np.random.seed(fine_tune_random_seed + 1)
 optimizer = tt.optim.Adam(lr=lr)
+
 if num_durations > 0:
     labtrans = NKSDiscrete.label_transform(num_durations)
     y_train_discrete = labtrans.fit_transform(*y_train.T)
@@ -228,31 +169,19 @@ else:
 
 model_filename = \
     os.path.join(output_dir, 'models',
-                 '%s_%s_exp%d_mf%d_msl%d_km%d_'
+                 '%s_%s_exp%d_%s_mf%d_msl%d_'
                  % (survival_estimator_name, dataset,
-                    experiment_idx, max_features,
-                    min_samples_leaf, use_km)
+                    experiment_idx, val_string, max_features,
+                    min_samples_leaf)
                  +
                  'bs%d_nep%d_nla%d_nno%d_'
                  % (batch_size, n_epochs, n_layers, n_nodes)
                  +
                  'lr%f_nd%d_test.pt'
                  % (lr, num_durations))
-if not os.path.isfile(model_filename):
-    print('*** Fitting with hyperparam:', hyperparam, flush=True)
-    if num_durations > 0:
-        surv_model.fit(X_train_std, y_train_discrete,
-                       batch_size, n_epochs, verbose=False)
-    else:
-        surv_model.fit(X_train_std,
-                       (y_train[:, 0],
-                        y_train[:, 1]), batch_size,
-                       n_epochs, verbose=False)
-    surv_model.save_net(model_filename)
-else:
-    print('*** Loading ***', flush=True)
-    surv_model.load_net(model_filename)
-
+assert os.path.isfile(model_filename)
+print('*** Loading ***', flush=True)
+surv_model.load_net(model_filename)
 
 if num_durations > 0:
     surv_df = surv_model.interpolate(10).predict_surv_df(X_test_std)
@@ -381,9 +310,10 @@ for survival_time_estimator in ['mean', 'median']:
         qhats_np = np.array(qhats_np)
         output_filename_prefix = \
             os.path.join(output_dir, 'split_conformal_prediction',
-                         '%s_%s_exp%d_bs%d_nep%d_nla%d_nno%d_lr%f_'
+                         '%s_%s_exp%d_%s_bs%d_nep%d_nla%d_nno%d_lr%f_'
                          % (survival_estimator_name, dataset, experiment_idx,
-                            batch_size, n_epochs, n_layers, n_nodes, lr)
+                            val_string, batch_size, n_epochs, n_layers, n_nodes,
+                            lr)
                          +
                          'nd%d_%s_calib%f'
                          % (num_durations, survival_time_estimator, calib_frac))
@@ -526,9 +456,10 @@ for survival_time_estimator in ['mean', 'median']:
         qhats_np = np.array(qhats_np)
         output_filename_prefix = \
             os.path.join(output_dir, 'weighted_split_conformal_prediction',
-                         '%s_%s_exp%d_bs%d_nep%d_nla%d_nno%d_lr%f_'
+                         '%s_%s_exp%d_%s_bs%d_nep%d_nla%d_nno%d_lr%f_'
                          % (survival_estimator_name, dataset, experiment_idx,
-                            batch_size, n_epochs, n_layers, n_nodes, lr)
+                            val_string, batch_size, n_epochs, n_layers, n_nodes,
+                            lr)
                          +
                          'nd%d_%s_calib%f'
                          % (num_durations, survival_time_estimator, calib_frac))

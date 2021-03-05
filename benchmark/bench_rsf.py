@@ -10,13 +10,13 @@ import sys
 sys.path.insert(1, os.path.dirname(sys.path[0]))
 __package__ = 'benchmark'
 import time
+from shutil import copyfile
 
 import numpy as np
 import pandas as pd
 from joblib import dump, load
-from lifelines.utils import concordance_index
 from pycox.evaluation import EvalSurv
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 
 from npsurvival_models import RandomSurvivalForest
 from survival_datasets import load_dataset
@@ -32,6 +32,8 @@ if not (len(sys.argv) == 2 and os.path.isfile(sys.argv[1])):
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
 n_experiment_repeats = int(config['DEFAULT']['n_experiment_repeats'])
+use_cross_val = int(config['DEFAULT']['use_cross_val']) > 0
+val_ratio = float(config['DEFAULT']['simple_data_splitting_val_ratio'])
 cross_val_n_folds = int(config['DEFAULT']['cross_val_n_folds'])
 datasets = ast.literal_eval(config['DEFAULT']['datasets'])
 output_dir = config['DEFAULT']['output_dir']
@@ -51,23 +53,25 @@ else:
     n_jobs = min(max_n_cores, os.cpu_count())
 
 hyperparams = \
-    [(max_features, min_samples_leaf, use_km)
+    [(max_features, min_samples_leaf)
      for max_features
      in ast.literal_eval(config['method: %s'
                                 % survival_estimator_name]['max_features'])
      for min_samples_leaf
      in ast.literal_eval(config['method: %s'
-                                % survival_estimator_name]['min_samples_leaf'])
-     for use_km
-     in ast.literal_eval(config['method: %s'
-                                % survival_estimator_name]['use_km'])]
+                                % survival_estimator_name]['min_samples_leaf'])]
+
+if use_cross_val:
+    val_string = 'cv%d' % cross_val_n_folds
+else:
+    val_string = 'vr%f' % val_ratio
 
 output_test_table_filename \
     = os.path.join(output_dir,
-                   '%s_experiments%d_cv%d_test_metrics_bootstrap.csv'
+                   '%s_nexp%d_%s_test_metrics.csv'
                    % (survival_estimator_name,
                       n_experiment_repeats,
-                      cross_val_n_folds))
+                      val_string))
 output_test_table_file = open(output_test_table_filename, 'w')
 test_csv_writer = csv.writer(output_test_table_file)
 test_csv_writer.writerow(['dataset',
@@ -99,48 +103,59 @@ for experiment_idx in range(n_experiment_repeats):
 
         output_train_metrics_filename \
             = os.path.join(output_dir, 'train',
-                           '%s_%s_exp%d_cv%d_train_metrics.txt'
+                           '%s_%s_exp%d_%s_train_metrics.txt'
                            % (survival_estimator_name, dataset, experiment_idx,
-                              cross_val_n_folds))
-        output_best_cv_hyperparam_filename \
+                              val_string))
+        output_best_val_hyperparam_filename \
             = os.path.join(output_dir, 'train',
-                           '%s_%s_exp%d_cv%d_best_cv_hyperparams.pkl'
+                           '%s_%s_exp%d_%s_best_val_hyperparams.pkl'
                            % (survival_estimator_name, dataset, experiment_idx,
-                              cross_val_n_folds))
+                              val_string))
         if not os.path.isfile(output_train_metrics_filename) or \
-                not os.path.isfile(output_best_cv_hyperparam_filename):
+                not os.path.isfile(output_best_val_hyperparam_filename):
             print('Training...', flush=True)
             train_metrics_file = open(output_train_metrics_filename, 'w')
-            best_cv_hyperparams = {}
+            best_val_hyperparams = {}
 
             # load_dataset already shuffles; no need to reshuffle
-            kf = KFold(n_splits=cross_val_n_folds, shuffle=False)
+            if use_cross_val:
+                kf = KFold(n_splits=cross_val_n_folds, shuffle=False)
+                train_data_split = list(kf.split(X_train))
+            else:
+                train_data_split = [train_test_split(range(len(X_train)),
+                                                     test_size=val_ratio,
+                                                     shuffle=False)]
+
             max_cindex = -np.inf
             min_integrated_brier = np.inf
             arg_max_cindex = None
             arg_min_integrated_brier = None
 
             for hyperparam in hyperparams:
-                max_features, min_samples_leaf, use_km = hyperparam
+                max_features, min_samples_leaf = hyperparam
                 cindex_scores = []
                 integrated_brier_scores = []
 
-                for cross_val_idx, (train_idx, val_idx) \
-                        in enumerate(kf.split(X_train)):
-                    tic = time.time()
+                for fold_idx, (train_idx, val_idx) \
+                        in enumerate(train_data_split):
                     fold_X_train = X_train[train_idx]
                     fold_y_train = y_train[train_idx]
                     fold_X_val = X_train[val_idx]
                     fold_y_val = y_train[val_idx]
 
-                    # random survival forests don't need feature standardization
+                    fold_X_train_std, transformer = \
+                            compute_features_and_transformer(fold_X_train)
+                    fold_X_val_std = transform_features(fold_X_val, transformer)
+
+                    tic = time.time()
 
                     model_filename = \
                         os.path.join(output_dir, 'models',
-                                     '%s_%s_exp%d_mf%d_msl%d_cv%d.pkl'
+                                     '%s_%s_exp%d_%s_mf%d_msl%d_fold%d.pkl'
                                      % (survival_estimator_name, dataset,
-                                        experiment_idx, max_features,
-                                        min_samples_leaf, cross_val_idx))
+                                        experiment_idx, val_string,
+                                        max_features, min_samples_leaf,
+                                        fold_idx))
                     time_elapsed_filename = model_filename[:-4] + '_time.txt'
                     if not os.path.isfile(model_filename):
                         surv_model = \
@@ -166,16 +181,10 @@ for experiment_idx in range(n_experiment_repeats):
                               + '%f second(s)' % elapsed)
 
                     sorted_unique_fold_y_train = np.unique(fold_y_train[:, 0])
-                    if use_km == 1:
-                        use_kaplan_meier = True
-                    else:
-                        use_kaplan_meier = False
                     surv = \
                         surv_model.predict_surv(fold_X_val,
                                                 sorted_unique_fold_y_train,
-                                                presorted_times=True,
-                                                use_kaplan_meier= \
-                                                    use_kaplan_meier)
+                                                presorted_times=True)
 
                     surv_df = pd.DataFrame(surv.T,
                                            columns=range(fold_X_val.shape[0]),
@@ -212,20 +221,21 @@ for experiment_idx in range(n_experiment_repeats):
 
             train_metrics_file.close()
 
-            best_cv_hyperparams['cindex_td'] = (arg_max_cindex, max_cindex)
-            best_cv_hyperparams['integrated_brier'] \
-                = (arg_min_integrated_brier, min_integrated_brier)
+            best_val_hyperparams['cindex_td'] = \
+                (arg_max_cindex, max_cindex)
+            best_val_hyperparams['integrated_brier'] = \
+                (arg_min_integrated_brier, min_integrated_brier)
 
-            with open(output_best_cv_hyperparam_filename, 'wb') as pickle_file:
-                pickle.dump(best_cv_hyperparams, pickle_file,
+            with open(output_best_val_hyperparam_filename, 'wb') as pickle_file:
+                pickle.dump(best_val_hyperparams, pickle_file,
                             protocol=pickle.HIGHEST_PROTOCOL)
         else:
             print('Loading previous cross-validation results...', flush=True)
-            with open(output_best_cv_hyperparam_filename, 'rb') as pickle_file:
-                best_cv_hyperparams = pickle.load(pickle_file)
-            arg_max_cindex, max_cindex = best_cv_hyperparams['cindex_td']
+            with open(output_best_val_hyperparam_filename, 'rb') as pickle_file:
+                best_val_hyperparams = pickle.load(pickle_file)
+            arg_max_cindex, max_cindex = best_val_hyperparams['cindex_td']
             arg_min_integrated_brier, min_integrated_brier \
-                = best_cv_hyperparams['integrated_brier']
+                = best_val_hyperparams['integrated_brier']
 
         print('Best hyperparameters for maximizing training c-index (td):',
               arg_max_cindex, '-- achieves score %5.4f' % max_cindex,
@@ -240,17 +250,32 @@ for experiment_idx in range(n_experiment_repeats):
 
         print()
         print('Testing...', flush=True)
+        X_train_std, transformer = \
+                compute_features_and_transformer(X_train)
+        X_test_std = transform_features(X_test, transformer)
         final_test_scores = {}
         for hyperparam in best_hyperparams:
-            max_features, min_samples_leaf, use_km = hyperparam
+            max_features, min_samples_leaf = hyperparam
             tic = time.time()
             model_filename = \
                 os.path.join(output_dir, 'models',
-                             '%s_%s_exp%d_mf%d_msl%d_test.pkl'
+                             '%s_%s_exp%d_%s_mf%d_msl%d_test.pkl'
                              % (survival_estimator_name, dataset,
-                                experiment_idx, max_features,
+                                experiment_idx, val_string, max_features,
                                 min_samples_leaf))
             time_elapsed_filename = model_filename[:-4] + '_time.txt'
+            if not use_cross_val:
+                val_model_filename = \
+                    os.path.join(output_dir, 'models',
+                                 '%s_%s_exp%d_%s_mf%d_msl%d_fold%d.pkl'
+                                 % (survival_estimator_name, dataset,
+                                    experiment_idx, val_string,
+                                    max_features, min_samples_leaf, 0))
+                val_time_elapsed_filename = \
+                    val_model_filename[:-4] + '_time.txt'
+                copyfile(val_model_filename, model_filename)
+                copyfile(val_time_elapsed_filename,
+                         time_elapsed_filename)
             if not os.path.isfile(model_filename):
                 surv_model = \
                     RandomSurvivalForest(n_estimators=100,
@@ -275,13 +300,8 @@ for experiment_idx in range(n_experiment_repeats):
 
 
             sorted_unique_y_train = np.unique(y_train[:, 0])
-            if use_km == 1:
-                use_kaplan_meier = True
-            else:
-                use_kaplan_meier = False
             surv = surv_model.predict_surv(X_test, sorted_unique_y_train,
-                                           presorted_times=True,
-                                           use_kaplan_meier=use_kaplan_meier)
+                                           presorted_times=True)
 
             surv_df = pd.DataFrame(surv.T,
                                    columns=range(X_test.shape[0]),
@@ -306,10 +326,10 @@ for experiment_idx in range(n_experiment_repeats):
 
             bootstrap_dir = \
                 os.path.join(output_dir, 'bootstrap',
-                             '%s_%s_exp%d_mf%d_msl%d_km%d_test'
+                             '%s_%s_exp%d_%s_mf%d_msl%d_test'
                              % (survival_estimator_name, dataset,
-                                experiment_idx, max_features,
-                                min_samples_leaf, use_km))
+                                experiment_idx, val_string, max_features,
+                                min_samples_leaf))
             os.makedirs(bootstrap_dir, exist_ok=True)
             cindex_td_filename = os.path.join(bootstrap_dir,
                                               'cindex_td_scores.txt')
