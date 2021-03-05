@@ -7,17 +7,17 @@ This code accompanies the paper:
 > George H. Chen. "Deep Kernel Survival Analysis and Subject-Specific Survival Time Prediction Intervals". MLHC 2020.\
 > \[[arXiv](https://arxiv.org/abs/2007.12975)\]
 
-Code requirements:
-
-- Anaconda Python 3 (tested with Python version 3.6)
-- Additional packages: joblib, lifelines, pyarrow, pytorch (tested with PyTorch version 1.5 with CUDA 10.2)
-- cython compilation is required for the random survival forests implementation used:
-
 **Major code changes:**
 
 - March 4, 2021: added support for simple data splitting as an alternative to cross-validation for the hyperparameter sweep; simple data splitting just corresponds to the standard approach of splitting the training data into a proper training set and a validation set, and then tuning hyperparameters based on this validation set (including optionally using early stopping for neural net approaches)--there is no re-training on the full training set after the best hyperparameter is chosen; this is now set as the default behavior in `config.ini` (the results follow similar trends as those reported in the paper and runs faster than cross-validation)
 
 **Recommendation:** There are lots of variants of neural/deep kernel survival analysis that are implemented. At least for the datasets considered, warm-starting using random survival forests tends to work best (train the random survival forest (RSF) model first, and then run the code for NKS-MLP with RSF initialization).
+
+### Code requirements
+
+- Anaconda Python 3 (tested with Python version 3.6)
+- Additional packages: joblib, lifelines, pyarrow, pytorch (tested with PyTorch version 1.5 with CUDA 10.2)
+- cython compilation is required for the random survival forests implementation used:
 
 ```
 python setup_random_survival_forest_cython.py build_ext --inplace
